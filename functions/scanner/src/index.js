@@ -1,12 +1,11 @@
-// ✅ Appwrite Function 入口
-// 所有依赖的代码必须在这个文件或同目录下
+/**
+ * Scanner Function - 扫描 Order Block
+ */
 
 const { Client, Databases, Query, ID } = require('node-appwrite');
-const axios = require('axios');
-
-// ✅ 导入本地模块（相对路径）
+const BinanceAPI = require('./binance');
 const { findPotentialOrderBlocks } = require('./ob-detector');
-const { fetchKlines } = require('./binance');
+const { COLLECTIONS } = require('./constants');
 
 module.exports = async ({ req, res, log, error }) => {
   const startTime = Date.now();
@@ -21,10 +20,14 @@ module.exports = async ({ req, res, log, error }) => {
       apiKey: process.env.APPWRITE_API_KEY,
       databaseId: process.env.APPWRITE_DATABASE_ID,
       symbol: process.env.TRADING_SYMBOL || 'BTCUSDT',
-      timeframe: process.env.ENTRY_TIMEFRAME || '4h'
+      timeframe: process.env.ENTRY_TIMEFRAME || '4h',
+      swingLength: parseInt(process.env.OB_SWING_LENGTH) || 10,
+      volumeLookback: parseInt(process.env.VOLUME_LOOKBACK) || 20,
+      volumeMethod: process.env.VOLUME_METHOD || 'percentile',
+      volumeParam: parseInt(process.env.VOLUME_PARAM) || 70
     };
 
-    // 初始化 Appwrite
+    // ✅ 初始化 Appwrite Client
     const client = new Client()
       .setEndpoint(config.endpoint)
       .setProject(config.projectId)
@@ -32,32 +35,46 @@ module.exports = async ({ req, res, log, error }) => {
 
     const databases = new Databases(client);
 
-    // 获取 K 线
-    const klines = await fetchKlines(config.symbol, config.timeframe, 100);
+    // ✅ 初始化 Binance API
+    const binance = new BinanceAPI();
+    
+    // ✅ 获取 K 线数据
+    log(`Fetching ${config.timeframe} klines for ${config.symbol}...`);
+    const klines = await binance.getRecentKlines(config.symbol, config.timeframe, 100);
     log(`Fetched ${klines.length} klines`);
 
-    // 检测 OB
+    if (klines.length === 0) {
+      throw new Error('No klines data received');
+    }
+
+    // ✅ 检测 OB
+    log('Detecting Order Blocks...');
     const { bullishOBs, bearishOBs } = findPotentialOrderBlocks(
       klines,
-      parseInt(process.env.OB_SWING_LENGTH) || 10,
-      parseInt(process.env.VOLUME_LOOKBACK) || 20,
-      process.env.VOLUME_METHOD || 'percentile',
-      parseInt(process.env.VOLUME_PARAM) || 70
+      config.swingLength,
+      config.volumeLookback,
+      config.volumeMethod,
+      config.volumeParam
     );
 
     const allOBs = [...bullishOBs, ...bearishOBs];
-    log(`Found ${allOBs.length} potential OBs`);
+    log(`Found ${allOBs.length} potential OBs (${bullishOBs.length} bullish, ${bearishOBs.length} bearish)`);
 
-    // 保存新 OB
+    // ✅ 只保存最新形成的 OB（最近 2 根 K 线内）
     const latestIndex = klines.length - 1;
-    const newOBs = allOBs.filter(ob => ob.creationIndex >= latestIndex - 2 && ob.isValid);
+    const newOBs = allOBs.filter(ob => 
+      ob.creationIndex >= latestIndex - 2 && ob.isValid
+    );
+
+    log(`Processing ${newOBs.length} new OBs...`);
 
     let savedCount = 0;
     for (const ob of newOBs) {
       try {
+        // 检查是否已存在（避免重复保存）
         const existing = await databases.listDocuments(
           config.databaseId,
-          'order_blocks',
+          COLLECTIONS.ORDER_BLOCKS,
           [
             Query.equal('symbol', config.symbol),
             Query.equal('confirmationTime', ob.confirmationCandle.timestamp.toISOString()),
@@ -67,9 +84,10 @@ module.exports = async ({ req, res, log, error }) => {
         );
 
         if (existing.documents.length === 0) {
+          // 保存新 OB
           await databases.createDocument(
             config.databaseId,
-            'order_blocks',
+            COLLECTIONS.ORDER_BLOCKS,
             ID.unique(),
             {
               symbol: config.symbol,
@@ -86,19 +104,22 @@ module.exports = async ({ req, res, log, error }) => {
               createdAt: new Date().toISOString()
             }
           );
+          
           savedCount++;
-          log(`✅ Saved ${ob.type} OB @ ${ob.low}-${ob.high}`);
+          log(`✅ Saved ${ob.type} OB @ ${ob.low.toFixed(2)}-${ob.high.toFixed(2)}`);
         }
-      } catch (err) {
-        error(`Failed to save OB: ${err.message}`);
+      } catch (saveErr) {
+        error(`Failed to save OB: ${saveErr.message}`);
       }
     }
 
-    // 更新已有 OB 状态
+    // ✅ 更新已有 OB 的状态（检查是否被突破）
+    log('Checking existing OBs for breaks...');
     const currentPrice = klines[latestIndex].close;
+    
     const activeOBs = await databases.listDocuments(
       config.databaseId,
-      'order_blocks',
+      COLLECTIONS.ORDER_BLOCKS,
       [
         Query.equal('symbol', config.symbol),
         Query.equal('isActive', true),
@@ -115,7 +136,7 @@ module.exports = async ({ req, res, log, error }) => {
       if (isBroken) {
         await databases.updateDocument(
           config.databaseId,
-          'order_blocks',
+          COLLECTIONS.ORDER_BLOCKS,
           obDoc.$id,
           {
             isActive: false,
@@ -125,7 +146,7 @@ module.exports = async ({ req, res, log, error }) => {
           }
         );
         brokenCount++;
-        log(`❌ OB ${obDoc.$id} broken`);
+        log(`❌ OB ${obDoc.$id.substring(0, 8)} broken at ${currentPrice.toFixed(2)}`);
       }
     }
 
@@ -134,15 +155,26 @@ module.exports = async ({ req, res, log, error }) => {
 
     return res.json({
       success: true,
-      newOBs: savedCount,
-      brokenOBs: brokenCount,
-      currentPrice,
+      summary: {
+        newOBs: savedCount,
+        brokenOBs: brokenCount,
+        totalOBsChecked: activeOBs.documents.length,
+        currentPrice,
+        symbol: config.symbol,
+        timeframe: config.timeframe
+      },
       duration,
       timestamp: new Date().toISOString()
     });
 
   } catch (err) {
     error(`Scanner error: ${err.message}`);
-    return res.json({ success: false, error: err.message }, 500);
+    error(err.stack);
+    
+    return res.json({
+      success: false,
+      error: err.message,
+      timestamp: new Date().toISOString()
+    }, 500);
   }
 };
