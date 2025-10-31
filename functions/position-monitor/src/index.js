@@ -1,6 +1,6 @@
-const AppwriteClient = require('../../shared/appwrite-client');
-const HyperliquidAPI = require('../../shared/hyperliquid');
-const CONFIG = require('../../config/config');
+const AppwriteClient = require('../../../shared/appwrite-client');
+const HyperliquidAPI = require('../../../shared/hyperliquid');
+const CONFIG = require('../../../config/config');
 
 module.exports = async ({ req, res, log, error }) => {
   try {

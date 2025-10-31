@@ -1,7 +1,7 @@
 const { ATR } = require('technicalindicators');
-const AppwriteClient = require('../../shared/appwrite-client');
-const BinanceAPI = require('../../shared/binance');
-const CONFIG = require('../../config/config');
+const AppwriteClient = require('../../../shared/appwrite-client');
+const BinanceAPI = require('../../../shared/binance');
+const CONFIG = require('../../../config/config');
 
 module.exports = async ({ req, res, log, error }) => {
   try {
