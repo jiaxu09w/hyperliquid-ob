@@ -1,0 +1,11 @@
+{
+  "name": "entry-monitor",
+  "version": "1.0.0",
+  "description": "Entry Monitor",
+  "main": "index.js",
+  "dependencies": {
+    "node-appwrite": "12.0.1",
+    "axios": "1.6.0",
+    "ethers": "5.7.2"
+  }
+}

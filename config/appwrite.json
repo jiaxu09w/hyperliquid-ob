@@ -1,0 +1,46 @@
+{
+  "projectId": "your_project_id",
+  "projectName": "Hyperliquid OB Trader",
+  "functions": [
+    {
+      "id": "scanner",
+      "name": "Scanner",
+      "runtime": "node-18.0",
+      "path": "functions/scanner",
+      "entrypoint": "index.js",
+      "execute": ["any"],
+      "schedule": "*/5 * * * *",
+      "timeout": 30
+    },
+    {
+      "id": "entry-monitor",
+      "name": "Entry Monitor",
+      "runtime": "node-18.0",
+      "path": "functions/entry-monitor",
+      "entrypoint": "index.js",
+      "execute": ["any"],
+      "schedule": "2-59/5 * * * *",
+      "timeout": 30
+    },
+    {
+      "id": "position-monitor",
+      "name": "Position Monitor",
+      "runtime": "node-18.0",
+      "path": "functions/position-monitor",
+      "entrypoint": "index.js",
+      "execute": ["any"],
+      "schedule": "3-59/5 * * * *",
+      "timeout": 30
+    },
+    {
+      "id": "atr-calculator",
+      "name": "ATR Calculator",
+      "runtime": "node-18.0",
+      "path": "functions/atr-calculator",
+      "entrypoint": "index.js",
+      "execute": ["any"],
+      "schedule": "0 * * * *",
+      "timeout": 30
+    }
+  ]
+}

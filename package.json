@@ -1,0 +1,22 @@
+{
+  "name": "hyperliquid-ob-trader",
+  "version": "1.0.0",
+  "description": "Order Block trading bot for Hyperliquid",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/test-functions.js",
+    "setup": "node scripts/setup-database.js",
+    "local": "node scripts/test-local.js",
+    "deploy": "bash scripts/deploy.sh"
+  },
+  "keywords": ["trading", "hyperliquid", "order-block"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "node-appwrite": "12.0.1",
+    "axios": "^1.6.0",
+    "ethers": "^5.7.2",
+    "dotenv": "^16.3.1",
+    "technicalindicators": "^3.1.0"
+  }
+}
