@@ -1,152 +1,421 @@
-const AppwriteClient = require('../../../shared/appwrite-client');
-const HyperliquidAPI = require('../../../shared/hyperliquid');
-const CONFIG = require('../../../config/config');
+/**
+ * Position Monitor - 监控持仓状态
+ * - 检查止损触发
+ * - HTF 目标检测
+ * - 反向 OB 检测
+ * - 追踪止损更新
+ * - 强平风险预警
+ */
+
+const { Client, Databases, Query, ID } = require('node-appwrite');
+const HyperliquidAPI = require('./hyperliquid');
+const { COLLECTIONS, SIDE, OB_TYPE, EXIT_REASON } = require('./constants');
 
 module.exports = async ({ req, res, log, error }) => {
+  const startTime = Date.now();
+
   try {
     log('👀 Position Monitor started');
-    
-    const appwrite = new AppwriteClient();
-    const symbol = CONFIG.TRADING.SYMBOL;
 
-    // 1. 获取所有未平仓位
-    const openPositions = await appwrite.getOpenPositions(symbol);
+    // ✅ 配置
+    const config = {
+      // Appwrite
+      endpoint: process.env.APPWRITE_ENDPOINT,
+      projectId: process.env.APPWRITE_PROJECT_ID,
+      apiKey: process.env.APPWRITE_API_KEY,
+      databaseId: process.env.APPWRITE_DATABASE_ID,
+      
+      // Trading
+      symbol: process.env.TRADING_SYMBOL || 'BTCUSDT',
+      tradingEnabled: process.env.TRADING_ENABLED === 'true',
+      
+      // Strategy
+      trailingStopTriggerPercent: 5,  // 盈利5%后启动追踪止损
+      trailingStopMultiplier: parseFloat(process.env.TRAILING_STOP_ATR_MULTIPLIER) || 2.5,
+      liquidationWarningPercent: 5,   // 距离强平价5%时预警
+    };
+
+    // ✅ 初始化 Appwrite
+    const client = new Client()
+      .setEndpoint(config.endpoint)
+      .setProject(config.projectId)
+      .setKey(config.apiKey);
+
+    const databases = new Databases(client);
+
+    // ✅ 1. 获取所有未平仓位
+    log(`Checking open positions for ${config.symbol}...`);
+    
+    const openPositions = await databases.listDocuments(
+      config.databaseId,
+      COLLECTIONS.POSITIONS,
+      [
+        Query.equal('symbol', config.symbol),
+        Query.equal('status', 'OPEN'),
+        Query.limit(10)
+      ]
+    );
+
     if (openPositions.documents.length === 0) {
-      return res.json({ success: true, action: 'no_positions' });
+      log('No open positions found');
+      return res.json({ 
+        success: true, 
+        action: 'no_positions',
+        message: 'No positions to monitor'
+      });
     }
 
-    const hl = new HyperliquidAPI(CONFIG.HYPERLIQUID.PRIVATE_KEY);
-    const currentPrice = await hl.getPrice(symbol);
+    log(`Found ${openPositions.documents.length} open position(s)`);
 
-    log(`Checking ${openPositions.documents.length} positions @ $${currentPrice}`);
+    // ✅ 2. 初始化 Hyperliquid
+    const hl = new HyperliquidAPI(
+      process.env.HYPERLIQUID_PRIVATE_KEY,
+      !config.tradingEnabled
+    );
+
+    const currentPrice = await hl.getPrice(config.symbol);
+    log(`Current price: $${currentPrice.toFixed(2)}\n`);
 
     const results = [];
 
+    // ✅ 3. 逐个检查持仓
     for (const posDoc of openPositions.documents) {
-      log(`Position ${posDoc.$id}: ${posDoc.side} @ $${posDoc.entryPrice}`);
+      log(`\n--- Position ${posDoc.$id.substring(0, 8)} ---`);
+      log(`Side: ${posDoc.side} | Entry: $${posDoc.avgEntryPrice.toFixed(2)} | Size: ${posDoc.size.toFixed(4)}`);
 
-      // 1. 验证持仓是否仍存在
-      const livePosition = await hl.getPosition(symbol.replace('USDT', ''));
-
+      // ✅ 3.1 验证持仓是否仍存在（可能已被止损）
+      const livePosition = await hl.getPosition(config.symbol.replace('USDT', ''));
+      
       if (!livePosition || (livePosition.szi !== undefined && Math.abs(livePosition.szi) === 0)) {
-        log(`⚠️ Position stopped out`);
+        log('⚠️  Position not found on exchange (likely stopped out)');
+        
+        // 标记为已平仓
+        await databases.updateDocument(
+          config.databaseId,
+          COLLECTIONS.POSITIONS,
+          posDoc.$id,
+          {
+            status: 'CLOSED',
+            exitTime: new Date().toISOString(),
+            exitReason: EXIT_REASON.STOP_LOSS_TRIGGERED,
+            exitPrice: posDoc.stopLoss,
+            pnl: posDoc.side === SIDE.LONG
+              ? (posDoc.stopLoss - posDoc.avgEntryPrice) * posDoc.size
+              : (posDoc.avgEntryPrice - posDoc.stopLoss) * posDoc.size
+          }
+        );
 
-        await appwrite.updatePosition(posDoc.$id, {
-          status: 'CLOSED',
-          exitTime: new Date().toISOString(),
-          exitReason: 'STOP_LOSS_TRIGGERED',
-          exitPrice: posDoc.stopLoss,
-          pnl: posDoc.side === 'LONG'
-            ? (posDoc.stopLoss - posDoc.entryPrice) * posDoc.size
-            : (posDoc.entryPrice - posDoc.stopLoss) * posDoc.size
+        results.push({
+          positionId: posDoc.$id,
+          action: 'detected_closed',
+          reason: EXIT_REASON.STOP_LOSS_TRIGGERED
         });
-
-        results.push({ positionId: posDoc.$id, action: 'detected_closed', reason: 'stop_loss' });
+        
+        log('✅ Marked as closed in database');
         continue;
       }
 
-      // 2. 计算未实现盈亏
-      const unrealizedPnL = posDoc.side === 'LONG'
-        ? (currentPrice - posDoc.entryPrice) * posDoc.size
-        : (posDoc.entryPrice - currentPrice) * posDoc.size;
+      // ✅ 3.2 计算未实现盈亏
+      const unrealizedPnL = posDoc.side === SIDE.LONG
+        ? (currentPrice - posDoc.avgEntryPrice) * posDoc.size
+        : (posDoc.avgEntryPrice - currentPrice) * posDoc.size;
 
-      const unrealizedPnLPercent = (unrealizedPnL / posDoc.margin) * 100;
+      const positionValue = posDoc.avgEntryPrice * posDoc.size;
+      const unrealizedPnLPercent = (unrealizedPnL / positionValue) * 100;
 
-      log(`   Unrealized PnL: $${unrealizedPnL.toFixed(2)} (${unrealizedPnLPercent.toFixed(1)}%)`);
+      log(`Unrealized PnL: $${unrealizedPnL.toFixed(2)} (${unrealizedPnLPercent.toFixed(2)}%)`);
 
-      // 3. 检查 HTF 目标
-      const htfOBs = await appwrite.getActiveOBs(symbol);
+      // ✅ 3.3 检查 HTF 目标
+      log('Checking HTF targets...');
       
-      for (const htfOB of htfOBs.documents || []) {
-        if (!CONFIG.STRATEGY.TIMEFRAMES.HTF_TARGETS.includes(htfOB.timeframe)) continue;
+      const htfTimeframes = (process.env.HTF_TARGETS || '1w,1d').split(',');
+      let hitTarget = false;
 
-        const isTarget =
-          (posDoc.side === 'LONG' && htfOB.type === 'BEARISH' && currentPrice >= htfOB.bottom) ||
-          (posDoc.side === 'SHORT' && htfOB.type === 'BULLISH' && currentPrice <= htfOB.top);
+      for (const htfTf of htfTimeframes) {
+        const htfOBs = await databases.listDocuments(
+          config.databaseId,
+          COLLECTIONS.ORDER_BLOCKS,
+          [
+            Query.equal('symbol', config.symbol),
+            Query.equal('timeframe', htfTf.trim()),
+            Query.equal('isActive', true),
+            Query.limit(10)
+          ]
+        );
 
-        if (isTarget) {
-          log(`🎯 HTF target reached`);
+        for (const htfOB of htfOBs.documents) {
+          // 检查是否是反向 OB 且价格已触及
+          const isTarget = 
+            (posDoc.side === SIDE.LONG && 
+             htfOB.type === OB_TYPE.BEARISH && 
+             currentPrice >= htfOB.bottom) ||
+            (posDoc.side === SIDE.SHORT && 
+             htfOB.type === OB_TYPE.BULLISH && 
+             currentPrice <= htfOB.top);
 
-          const closeResult = await hl.closePosition({
-            symbol,
-            size: posDoc.size,
-            price: currentPrice
-          });
+          if (isTarget) {
+            const targetPrice = posDoc.side === SIDE.LONG ? htfOB.bottom : htfOB.top;
+            log(`🎯 HTF ${htfTf} target reached @ $${targetPrice.toFixed(2)}`);
 
-          if (closeResult.success) {
-            await appwrite.updatePosition(posDoc.$id, {
-              status: 'CLOSED',
-              exitTime: new Date().toISOString(),
-              exitReason: `HTF_TARGET_${htfOB.timeframe}`,
-              exitPrice: closeResult.executionPrice,
-              pnl: unrealizedPnL
+            // 平仓
+            const closeResult = await hl.closePosition({
+              symbol: config.symbol,
+              size: posDoc.size,
+              price: currentPrice
             });
 
-            results.push({ positionId: posDoc.$id, action: 'closed', reason: 'htf_target', pnl: unrealizedPnL });
-            break;
+            if (closeResult.success) {
+              await databases.updateDocument(
+                config.databaseId,
+                COLLECTIONS.POSITIONS,
+                posDoc.$id,
+                {
+                  status: 'CLOSED',
+                  exitTime: new Date().toISOString(),
+                  exitReason: `HTF_TARGET_${htfTf}`,
+                  exitPrice: closeResult.executionPrice || currentPrice,
+                  pnl: unrealizedPnL,
+                  exitFee: closeResult.fee || 0
+                }
+              );
+
+              results.push({
+                positionId: posDoc.$id,
+                action: 'closed',
+                reason: `HTF_TARGET_${htfTf}`,
+                pnl: unrealizedPnL
+              });
+
+              log('✅ Position closed at HTF target');
+              hitTarget = true;
+              break;
+            }
+          }
+        }
+        
+        if (hitTarget) break;
+      }
+
+      if (hitTarget) continue;
+
+      // ✅ 3.4 检查反向 OB
+      log('Checking for reversal OBs...');
+      
+      const entryTfOBs = await databases.listDocuments(
+        config.databaseId,
+        COLLECTIONS.ORDER_BLOCKS,
+        [
+          Query.equal('symbol', config.symbol),
+          Query.equal('timeframe', process.env.ENTRY_TIMEFRAME || '4h'),
+          Query.equal('isActive', true),
+          Query.orderDesc('confirmationTime'),
+          Query.limit(5)
+        ]
+      );
+
+      let foundReversal = false;
+      for (const ob of entryTfOBs.documents) {
+        const isReversal = 
+          (posDoc.side === SIDE.LONG && ob.type === OB_TYPE.BEARISH) ||
+          (posDoc.side === SIDE.SHORT && ob.type === OB_TYPE.BULLISH);
+
+        if (isReversal) {
+          const obAge = (Date.now() - new Date(ob.confirmationTime)) / (1000 * 60 * 60);
+          
+          if (obAge <= 6) {  // 6 小时内形成
+            log(`🔄 Reversal OB detected (${obAge.toFixed(1)}h old)`);
+
+            const closeResult = await hl.closePosition({
+              symbol: config.symbol,
+              size: posDoc.size,
+              price: currentPrice
+            });
+
+            if (closeResult.success) {
+              await databases.updateDocument(
+                config.databaseId,
+                COLLECTIONS.POSITIONS,
+                posDoc.$id,
+                {
+                  status: 'CLOSED',
+                  exitTime: new Date().toISOString(),
+                  exitReason: EXIT_REASON.REVERSAL_OB,
+                  exitPrice: closeResult.executionPrice || currentPrice,
+                  pnl: unrealizedPnL,
+                  exitFee: closeResult.fee || 0
+                }
+              );
+
+              results.push({
+                positionId: posDoc.$id,
+                action: 'closed',
+                reason: EXIT_REASON.REVERSAL_OB,
+                pnl: unrealizedPnL
+              });
+
+              log('✅ Position closed on reversal OB');
+              foundReversal = true;
+              break;
+            }
           }
         }
       }
 
-      // 4. 追踪止损
-      if (unrealizedPnLPercent > CONFIG.STRATEGY.TRAILING_STOP_TRIGGER_PERCENT) {
-        const atrData = await appwrite.getMarketData(symbol, 'ATR', CONFIG.STRATEGY.TIMEFRAMES.ENTRY);
-        const atr = atrData ? atrData.value : 1000;
+      if (foundReversal) continue;
 
-        const newStopLoss = posDoc.side === 'LONG'
-          ? currentPrice - (atr * CONFIG.STRATEGY.TRAILING_STOP_ATR_MULTIPLIER)
-          : currentPrice + (atr * CONFIG.STRATEGY.TRAILING_STOP_ATR_MULTIPLIER);
+      // ✅ 3.5 追踪止损更新
+      if (unrealizedPnLPercent > config.trailingStopTriggerPercent) {
+        log(`Checking trailing stop (profit: ${unrealizedPnLPercent.toFixed(2)}%)...`);
 
-        const shouldUpdate = posDoc.side === 'LONG'
-          ? newStopLoss > posDoc.stopLoss
-          : newStopLoss < posDoc.stopLoss;
+        // 获取 ATR
+        const atrData = await databases.listDocuments(
+          config.databaseId,
+          COLLECTIONS.MARKET_DATA,
+          [
+            Query.equal('symbol', config.symbol),
+            Query.equal('indicator', 'ATR'),
+            Query.orderDesc('timestamp'),
+            Query.limit(1)
+          ]
+        );
 
-        if (shouldUpdate) {
-          log(`📈 Updating trailing stop: ${posDoc.stopLoss.toFixed(0)} → ${newStopLoss.toFixed(0)}`);
+        if (atrData.documents.length > 0) {
+          const atr = atrData.documents[0].value;
+          
+          const newStopLoss = posDoc.side === SIDE.LONG
+            ? currentPrice - (atr * config.trailingStopMultiplier)
+            : currentPrice + (atr * config.trailingStopMultiplier);
 
-          const updateResult = await hl.updateStopLoss({
-            symbol,
-            stopLossOrderId: posDoc.stopLossOrderId,
-            newStopLoss
-          });
+          const shouldUpdate = posDoc.side === SIDE.LONG
+            ? newStopLoss > posDoc.stopLoss
+            : newStopLoss < posDoc.stopLoss;
 
-          if (updateResult.success) {
-            await appwrite.updatePosition(posDoc.$id, {
-              stopLoss: newStopLoss,
-              stopLossOrderId: updateResult.newStopLossOrderId,
-              lastStopUpdate: new Date().toISOString()
+          if (shouldUpdate) {
+            log(`📈 Updating trailing stop: $${posDoc.stopLoss.toFixed(2)} → $${newStopLoss.toFixed(2)}`);
+
+            // 更新交易所的止损单
+            const updateResult = await hl.updateStopLoss({
+              symbol: config.symbol,
+              stopLossOrderId: posDoc.stopLossOrderId,
+              newStopLoss
             });
 
-            results.push({ positionId: posDoc.$id, action: 'trailing_stop_updated', newStopLoss });
+            if (updateResult.success) {
+              await databases.updateDocument(
+                config.databaseId,
+                COLLECTIONS.POSITIONS,
+                posDoc.$id,
+                {
+                  stopLoss: newStopLoss,
+                  stopLossOrderId: updateResult.newStopLossOrderId,
+                  lastStopUpdate: new Date().toISOString()
+                }
+              );
+
+              results.push({
+                positionId: posDoc.$id,
+                action: 'trailing_stop_updated',
+                newStopLoss
+              });
+
+              log('✅ Trailing stop updated');
+            } else {
+              log('⚠️  Failed to update trailing stop');
+            }
           }
         }
       }
 
-      // 5. 更新状态
-      await appwrite.updatePosition(posDoc.$id, {
-        lastChecked: new Date().toISOString(),
-        lastPrice: currentPrice,
-        unrealizedPnL
-      });
+      // ✅ 3.6 检查强平风险
+      if (posDoc.liquidationPrice) {
+        const distanceToLiq = posDoc.side === SIDE.LONG
+          ? ((currentPrice - posDoc.liquidationPrice) / posDoc.liquidationPrice) * 100
+          : ((posDoc.liquidationPrice - currentPrice) / posDoc.liquidationPrice) * 100;
+
+        if (distanceToLiq < config.liquidationWarningPercent) {
+          log(`⚡ WARNING: Near liquidation! Distance: ${distanceToLiq.toFixed(2)}%`);
+
+          // 紧急平仓（可选）
+          if (distanceToLiq < 2) {
+            log('🚨 Emergency close initiated!');
+            
+            const closeResult = await hl.closePosition({
+              symbol: config.symbol,
+              size: posDoc.size,
+              price: currentPrice
+            });
+
+            if (closeResult.success) {
+              await databases.updateDocument(
+                config.databaseId,
+                COLLECTIONS.POSITIONS,
+                posDoc.$id,
+                {
+                  status: 'CLOSED',
+                  exitTime: new Date().toISOString(),
+                  exitReason: EXIT_REASON.EMERGENCY_CLOSE,
+                  exitPrice: closeResult.executionPrice || currentPrice,
+                  pnl: unrealizedPnL,
+                  exitFee: closeResult.fee || 0
+                }
+              );
+
+              results.push({
+                positionId: posDoc.$id,
+                action: 'emergency_close',
+                reason: 'near_liquidation',
+                pnl: unrealizedPnL
+              });
+
+              log('✅ Emergency close executed');
+              continue;
+            }
+          }
+        }
+      }
+
+      // ✅ 3.7 更新持仓状态
+      await databases.updateDocument(
+        config.databaseId,
+        COLLECTIONS.POSITIONS,
+        posDoc.$id,
+        {
+          lastChecked: new Date().toISOString(),
+          lastPrice: currentPrice,
+          unrealizedPnL
+        }
+      );
 
       results.push({
         positionId: posDoc.$id,
         action: 'monitored',
         unrealizedPnL,
-        unrealizedPnLPercent
+        unrealizedPnLPercent: unrealizedPnLPercent.toFixed(2)
       });
+
+      log('✅ Status updated');
     }
+
+    const duration = Date.now() - startTime;
+    log(`\n✅ Position Monitor completed in ${duration}ms`);
 
     return res.json({
       success: true,
       positionsChecked: openPositions.documents.length,
       currentPrice,
       results,
+      duration,
       timestamp: new Date().toISOString()
     });
 
   } catch (err) {
     error(`Position monitor error: ${err.message}`);
-    return res.json({ success: false, error: err.message }, 500);
+    error(err.stack);
+    
+    return res.json({ 
+      success: false, 
+      error: err.message,
+      timestamp: new Date().toISOString()
+    }, 500);
   }
 };
