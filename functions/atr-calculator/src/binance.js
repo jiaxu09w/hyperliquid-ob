@@ -1,5 +1,5 @@
 /**
- * Binance API 封装（修复版）
+ * Binance API 封装（增强错误处理）
  */
 
 const axios = require('axios');
@@ -16,12 +16,12 @@ class BinanceAPI {
    */
   async getRecentKlines(symbol, interval, limit = 100) {
     try {
-      // ✅ 清理参数（移除可能的空格和特殊字符）
-      const cleanSymbol = symbol.trim().toUpperCase();
-      const cleanInterval = interval.trim().toLowerCase();
-      const cleanLimit = Math.min(Math.max(1, parseInt(limit)), 1000);
+      // ✅ 严格清理参数
+      const cleanSymbol = this._cleanSymbol(symbol);
+      const cleanInterval = this._cleanInterval(interval);
+      const cleanLimit = this._cleanLimit(limit);
 
-      console.log(`[Binance] Fetching ${cleanLimit} ${cleanInterval} klines for ${cleanSymbol}...`);
+      console.log(`[Binance] Request: ${cleanSymbol} ${cleanInterval} limit=${cleanLimit}`);
 
       const response = await axios.get(`${this.baseURL}/klines`, {
         params: { 
@@ -29,27 +29,99 @@ class BinanceAPI {
           interval: cleanInterval, 
           limit: cleanLimit 
         },
-        timeout: this.timeout
+        timeout: this.timeout,
+        headers: {
+          'Content-Type': 'application/json'
+        }
       });
 
       if (!response.data || response.data.length === 0) {
         throw new Error('No data returned from Binance');
       }
 
+      console.log(`[Binance] ✅ Received ${response.data.length} klines`);
+
       return this._parseKlines(response.data);
     } catch (err) {
-      // ✅ 详细错误信息
+      // 详细错误日志
       if (err.response) {
-        console.error(`[Binance] API error: ${err.response.status} - ${JSON.stringify(err.response.data)}`);
-        throw new Error(`Binance API error: ${err.response.data.msg || err.message}`);
+        console.error(`[Binance] HTTP ${err.response.status}:`, JSON.stringify(err.response.data));
+        throw new Error(`Binance API error: ${err.response.data.msg || err.response.status}`);
+      } else if (err.request) {
+        console.error(`[Binance] No response received:`, err.message);
+        throw new Error(`Network error: ${err.message}`);
+      } else {
+        console.error(`[Binance] Request setup error:`, err.message);
+        throw new Error(`Failed to fetch klines: ${err.message}`);
       }
-      console.error(`[Binance] Network error: ${err.message}`);
-      throw new Error(`Failed to fetch klines: ${err.message}`);
     }
   }
 
   /**
-   * 获取历史 K 线数据（分页）
+   * 清理 symbol 参数
+   */
+  _cleanSymbol(symbol) {
+    if (!symbol) throw new Error('Symbol is required');
+    
+    // 移除空格、换行、注释
+    let cleaned = symbol.toString().trim();
+    
+    // 移除可能的注释
+    if (cleaned.includes('#')) {
+      cleaned = cleaned.split('#')[0].trim();
+    }
+    
+    // 转大写
+    cleaned = cleaned.toUpperCase();
+    
+    // 验证格式
+    if (!/^[A-Z0-9]+$/.test(cleaned)) {
+      throw new Error(`Invalid symbol format: ${symbol}`);
+    }
+    
+    return cleaned;
+  }
+
+  /**
+   * 清理 interval 参数
+   */
+  _cleanInterval(interval) {
+    if (!interval) throw new Error('Interval is required');
+    
+    let cleaned = interval.toString().trim();
+    
+    if (cleaned.includes('#')) {
+      cleaned = cleaned.split('#')[0].trim();
+    }
+    
+    cleaned = cleaned.toLowerCase();
+    
+    // 验证是否是有效的 interval
+    const validIntervals = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M'];
+    
+    if (!validIntervals.includes(cleaned)) {
+      throw new Error(`Invalid interval: ${interval}. Valid options: ${validIntervals.join(', ')}`);
+    }
+    
+    return cleaned;
+  }
+
+  /**
+   * 清理 limit 参数
+   */
+  _cleanLimit(limit) {
+    const numLimit = parseInt(limit);
+    
+    if (isNaN(numLimit) || numLimit < 1) {
+      throw new Error(`Invalid limit: ${limit}`);
+    }
+    
+    // Binance 最大 1000
+    return Math.min(Math.max(1, numLimit), 1000);
+  }
+
+  /**
+   * 获取历史 K 线数据
    */
   async getHistoricalKlines(symbol, interval, startTime, endTime) {
     const klines = [];
@@ -57,8 +129,8 @@ class BinanceAPI {
     const finalEndTime = new Date(endTime).getTime();
     const limit = 1000;
 
-    const cleanSymbol = symbol.trim().toUpperCase();
-    const cleanInterval = interval.trim().toLowerCase();
+    const cleanSymbol = this._cleanSymbol(symbol);
+    const cleanInterval = this._cleanInterval(interval);
 
     console.log(`[Binance] Fetching historical ${cleanInterval} klines for ${cleanSymbol}...`);
 
@@ -79,10 +151,9 @@ class BinanceAPI {
         klines.push(...response.data);
         currentStartTime = response.data[response.data.length - 1][0] + 1;
 
-        // 避免限流
         await this._sleep(200);
       } catch (err) {
-        console.error(`[Binance] API error: ${err.message}`);
+        console.error(`[Binance] Error: ${err.message}`);
         
         if (err.response?.status === 429) {
           console.log('[Binance] Rate limited, waiting 60s...');
@@ -116,16 +187,10 @@ class BinanceAPI {
     }));
   }
 
-  /**
-   * 延迟函数
-   */
   _sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  /**
-   * 获取服务器时间
-   */
   async getServerTime() {
     try {
       const response = await axios.get(`${this.baseURL}/time`, {
@@ -138,12 +203,9 @@ class BinanceAPI {
     }
   }
 
-  /**
-   * 获取交易对信息
-   */
   async getSymbolInfo(symbol) {
     try {
-      const cleanSymbol = symbol.trim().toUpperCase();
+      const cleanSymbol = this._cleanSymbol(symbol);
       
       const response = await axios.get(`${this.baseURL}/exchangeInfo`, {
         params: { symbol: cleanSymbol },

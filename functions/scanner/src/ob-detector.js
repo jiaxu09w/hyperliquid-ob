@@ -1,5 +1,5 @@
 /**
- * Order Block 检测逻辑
+ * Order Block 检测逻辑（完全匹配 TradingView）
  */
 
 const { OB_TYPE } = require('./constants');
@@ -12,7 +12,9 @@ function findPotentialOrderBlocks(
   swingLength = 10,
   volumeLookback = 20,
   volumeMethod = 'percentile',
-  volumeParam = 70
+  volumeParam = 70,
+  maxATRMultiplier = 3.5,
+  atr = null
 ) {
   let bullishOBs = [];
   let bearishOBs = [];
@@ -82,112 +84,200 @@ function findPotentialOrderBlocks(
 
     const currentCandle = klines[i];
 
-    // 看涨 OB 识别
+    // ═══════════════════════════════════════════════════════════════════════
+    // 看涨 OB 识别（TradingView 逻辑）
+    // ═══════════════════════════════════════════════════════════════════════
+    
     if (lastSwingHigh && !lastSwingHigh.crossed && currentCandle.close > lastSwingHigh.high) {
-      const volThresholdForBreakout = getVolumeThreshold(
-        Math.max(0, i - volumeLookback),
-        i,
-        volumeMethod,
-        volumeParam
-      );
+      // 可选：成交量过滤
+      const useVolumeFilter = volumeParam > 0;
+      let shouldCreateOB = true;
+      
+      if (useVolumeFilter) {
+        const volThreshold = getVolumeThreshold(
+          Math.max(0, i - volumeLookback),
+          i,
+          volumeMethod,
+          volumeParam
+        );
+        shouldCreateOB = currentCandle.volume >= volThreshold;
+      }
 
-      if (currentCandle.volume >= volThresholdForBreakout) {
+      if (shouldCreateOB) {
         lastSwingHigh.crossed = true;
         const searchRange = klines.slice(lastSwingHigh.index, i);
 
         if (searchRange.length > 0) {
-          let bestCandle = null;
-          const volThresholdForOB = getVolumeThreshold(
-            Math.max(0, lastSwingHigh.index - volumeLookback),
-            i,
-            volumeMethod,
-            volumeParam
-          );
+          // ✅ TradingView 逻辑：找最低点的蜡烛
+          let boxBottom = Math.min(searchRange[0].open, searchRange[0].close);
+          let boxTop = Math.max(searchRange[0].open, searchRange[0].close);
+          let boxIndex = 0;
 
-          // 优先选择高成交量的蜡烛
-          for (const candle of searchRange) {
-            if (candle.volume >= volThresholdForOB) {
-              if (!bestCandle || candle.low < bestCandle.low) {
-                bestCandle = candle;
-              }
+          for (let j = 0; j < searchRange.length; j++) {
+            const candle = searchRange[j];
+            const candleMin = Math.min(candle.open, candle.close);
+            const candleMax = Math.max(candle.open, candle.close);
+            
+            if (candleMin < boxBottom) {
+              boxBottom = candleMin;
+              boxTop = candleMax;
+              boxIndex = j;
             }
           }
 
-          // 降级：选最低点
-          if (!bestCandle) {
-            bestCandle = searchRange.reduce((prev, curr) =>
-              prev.low < curr.low ? prev : curr
-            );
-          }
+          const obCandle = searchRange[boxIndex];
+          
+          // ✅ 成交量：3 根蜡烛总和
+          const totalVolume = currentCandle.volume 
+            + (i >= 1 ? klines[i - 1].volume : 0) 
+            + (i >= 2 ? klines[i - 2].volume : 0);
+          
+          const obLowVolume = i >= 2 ? klines[i - 2].volume : 0;
+          const obHighVolume = currentCandle.volume + (i >= 1 ? klines[i - 1].volume : 0);
 
-          bullishOBs.push({
-            ...bestCandle,
-            type: OB_TYPE.BULLISH,
-            creationIndex: i,
-            confirmationCandle: {
-              index: i,
-              timestamp: currentCandle.timestamp,
-              close: currentCandle.close,
-              volume: currentCandle.volume
-            },
-            confidence: bestCandle.volume >= volThresholdForOB ? 'high' : 'low',
-            isValid: true,
-            isBroken: false
-          });
+          // 置信度
+          const volThresholdForConfidence = useVolumeFilter 
+            ? getVolumeThreshold(
+                Math.max(0, lastSwingHigh.index - volumeLookback),
+                i,
+                volumeMethod,
+                volumeParam
+              )
+            : 0;
+          
+          const confidence = obCandle.volume >= volThresholdForConfidence ? 'high' : 'low';
+
+          // ✅ ATR 大小限制
+          const obSize = Math.abs(boxTop - boxBottom);
+          const passesATRCheck = !atr || (obSize <= atr * maxATRMultiplier);
+
+          if (passesATRCheck) {
+            bullishOBs.push({
+              high: boxTop,
+              low: boxBottom,
+              type: OB_TYPE.BULLISH,
+              creationIndex: i,
+              confirmationCandle: {
+                index: i,
+                timestamp: currentCandle.timestamp,
+                close: currentCandle.close,
+                high: currentCandle.high,
+                low: currentCandle.low,
+                volume: currentCandle.volume
+              },
+              obCandle: {
+                timestamp: obCandle.timestamp,
+                high: obCandle.high,
+                low: obCandle.low,
+                open: obCandle.open,
+                close: obCandle.close,
+                volume: obCandle.volume
+              },
+              volume: totalVolume,
+              obLowVolume,
+              obHighVolume,
+              confidence,
+              isValid: true,
+              isBroken: false
+            });
+          }
         }
       }
     }
 
-    // 看跌 OB 识别
+    // ═══════════════════════════════════════════════════════════════════════
+    // 看跌 OB 识别（TradingView 逻辑）
+    // ═══════════════════════════════════════════════════════════════════════
+    
     if (lastSwingLow && !lastSwingLow.crossed && currentCandle.close < lastSwingLow.low) {
-      const volThresholdForBreakout = getVolumeThreshold(
-        Math.max(0, i - volumeLookback),
-        i,
-        volumeMethod,
-        volumeParam
-      );
+      const useVolumeFilter = volumeParam > 0;
+      let shouldCreateOB = true;
+      
+      if (useVolumeFilter) {
+        const volThreshold = getVolumeThreshold(
+          Math.max(0, i - volumeLookback),
+          i,
+          volumeMethod,
+          volumeParam
+        );
+        shouldCreateOB = currentCandle.volume >= volThreshold;
+      }
 
-      if (currentCandle.volume >= volThresholdForBreakout) {
+      if (shouldCreateOB) {
         lastSwingLow.crossed = true;
         const searchRange = klines.slice(lastSwingLow.index, i);
 
         if (searchRange.length > 0) {
-          let bestCandle = null;
-          const volThresholdForOB = getVolumeThreshold(
-            Math.max(0, lastSwingLow.index - volumeLookback),
-            i,
-            volumeMethod,
-            volumeParam
-          );
+          // ✅ TradingView 逻辑：找最高点的蜡烛
+          let boxTop = Math.max(searchRange[0].open, searchRange[0].close);
+          let boxBottom = Math.min(searchRange[0].open, searchRange[0].close);
+          let boxIndex = 0;
 
-          for (const candle of searchRange) {
-            if (candle.volume >= volThresholdForOB) {
-              if (!bestCandle || candle.high > bestCandle.high) {
-                bestCandle = candle;
-              }
+          for (let j = 0; j < searchRange.length; j++) {
+            const candle = searchRange[j];
+            const candleMax = Math.max(candle.open, candle.close);
+            const candleMin = Math.min(candle.open, candle.close);
+            
+            if (candleMax > boxTop) {
+              boxTop = candleMax;
+              boxBottom = candleMin;
+              boxIndex = j;
             }
           }
 
-          if (!bestCandle) {
-            bestCandle = searchRange.reduce((prev, curr) =>
-              prev.high > curr.high ? prev : curr
-            );
-          }
+          const obCandle = searchRange[boxIndex];
+          
+          const totalVolume = currentCandle.volume 
+            + (i >= 1 ? klines[i - 1].volume : 0) 
+            + (i >= 2 ? klines[i - 2].volume : 0);
+          
+          const obLowVolume = currentCandle.volume + (i >= 1 ? klines[i - 1].volume : 0);
+          const obHighVolume = i >= 2 ? klines[i - 2].volume : 0;
 
-          bearishOBs.push({
-            ...bestCandle,
-            type: OB_TYPE.BEARISH,
-            creationIndex: i,
-            confirmationCandle: {
-              index: i,
-              timestamp: currentCandle.timestamp,
-              close: currentCandle.close,
-              volume: currentCandle.volume
-            },
-            confidence: bestCandle.volume >= volThresholdForOB ? 'high' : 'low',
-            isValid: true,
-            isBroken: false
-          });
+          const volThresholdForConfidence = useVolumeFilter
+            ? getVolumeThreshold(
+                Math.max(0, lastSwingLow.index - volumeLookback),
+                i,
+                volumeMethod,
+                volumeParam
+              )
+            : 0;
+          
+          const confidence = obCandle.volume >= volThresholdForConfidence ? 'high' : 'low';
+
+          const obSize = Math.abs(boxTop - boxBottom);
+          const passesATRCheck = !atr || (obSize <= atr * maxATRMultiplier);
+
+          if (passesATRCheck) {
+            bearishOBs.push({
+              high: boxTop,
+              low: boxBottom,
+              type: OB_TYPE.BEARISH,
+              creationIndex: i,
+              confirmationCandle: {
+                index: i,
+                timestamp: currentCandle.timestamp,
+                close: currentCandle.close,
+                high: currentCandle.high,
+                low: currentCandle.low,
+                volume: currentCandle.volume
+              },
+              obCandle: {
+                timestamp: obCandle.timestamp,
+                high: obCandle.high,
+                low: obCandle.low,
+                open: obCandle.open,
+                close: obCandle.close,
+                volume: obCandle.volume
+              },
+              volume: totalVolume,
+              obLowVolume,
+              obHighVolume,
+              confidence,
+              isValid: true,
+              isBroken: false
+            });
+          }
         }
       }
     }
