@@ -16,7 +16,10 @@ const COLLECTIONS = {
 const POSITION_STATUS = {
   OPEN: 'OPEN',
   CLOSED: 'CLOSED',
-  LIQUIDATED: 'LIQUIDATED'
+  LIQUIDATED: 'LIQUIDATED',
+  PENDING: 'PENDING',
+  FAILED: 'FAILED',
+  CANCELLED: 'CANCELLED'
 };
 
 // 交易方向
@@ -59,28 +62,24 @@ const HYPERLIQUID = {
   BASE_URL: 'https://api.hyperliquid.xyz',
   TESTNET_URL: 'https://api.hyperliquid-testnet.xyz',
   
-  // 手续费
   FEES: {
-    MAKER: -0.00020,   // -0.02%
-    TAKER: 0.00035     // 0.035%
+    MAKER: -0.00020,
+    TAKER: 0.00035
   },
   
-  // 资金费率
   FUNDING: {
     INTERVAL_HOURS: 8,
-    DEFAULT_RATE: 0.0001,    // 0.01%
-    MAX_RATE: 0.0005         // 0.05%
+    DEFAULT_RATE: 0.0001,
+    MAX_RATE: 0.0005
   },
   
-  // 滑点
   SLIPPAGE: {
-    BASE_BPS: 2,             // 0.02%
+    BASE_BPS: 2,
     IMPACT_FACTOR: 0.0001
   },
   
-  // 强平
   LIQUIDATION: {
-    MMR: 0.004,              // 0.4% 维持保证金率
+    MMR: 0.004,
     BANKRUPTCY_BUFFER: 0.005
   }
 };
@@ -94,7 +93,7 @@ const MARKETS = {
     pricePrecision: 1,
     maxLeverage: 50,
     maintenanceMarginRate: 0.004,
-    defaultATR: 1000           // 默认 ATR（如果无法计算）
+    defaultATR: 1000
   },
   ETHUSDT: {
     symbol: 'ETH',

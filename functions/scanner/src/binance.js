@@ -1,5 +1,5 @@
 /**
- * Binance API 封装
+ * Binance API 封装（修复版）
  */
 
 const axios = require('axios');
@@ -16,14 +16,34 @@ class BinanceAPI {
    */
   async getRecentKlines(symbol, interval, limit = 100) {
     try {
+      // ✅ 清理参数（移除可能的空格和特殊字符）
+      const cleanSymbol = symbol.trim().toUpperCase();
+      const cleanInterval = interval.trim().toLowerCase();
+      const cleanLimit = Math.min(Math.max(1, parseInt(limit)), 1000);
+
+      console.log(`[Binance] Fetching ${cleanLimit} ${cleanInterval} klines for ${cleanSymbol}...`);
+
       const response = await axios.get(`${this.baseURL}/klines`, {
-        params: { symbol, interval, limit },
+        params: { 
+          symbol: cleanSymbol, 
+          interval: cleanInterval, 
+          limit: cleanLimit 
+        },
         timeout: this.timeout
       });
 
+      if (!response.data || response.data.length === 0) {
+        throw new Error('No data returned from Binance');
+      }
+
       return this._parseKlines(response.data);
     } catch (err) {
-      console.error(`Binance API error: ${err.message}`);
+      // ✅ 详细错误信息
+      if (err.response) {
+        console.error(`[Binance] API error: ${err.response.status} - ${JSON.stringify(err.response.data)}`);
+        throw new Error(`Binance API error: ${err.response.data.msg || err.message}`);
+      }
+      console.error(`[Binance] Network error: ${err.message}`);
       throw new Error(`Failed to fetch klines: ${err.message}`);
     }
   }
@@ -37,14 +57,17 @@ class BinanceAPI {
     const finalEndTime = new Date(endTime).getTime();
     const limit = 1000;
 
-    console.log(`[Binance] Fetching historical ${interval} klines for ${symbol}...`);
+    const cleanSymbol = symbol.trim().toUpperCase();
+    const cleanInterval = interval.trim().toLowerCase();
+
+    console.log(`[Binance] Fetching historical ${cleanInterval} klines for ${cleanSymbol}...`);
 
     while (currentStartTime < finalEndTime) {
       try {
         const response = await axios.get(`${this.baseURL}/klines`, {
           params: {
-            symbol,
-            interval,
+            symbol: cleanSymbol,
+            interval: cleanInterval,
             startTime: currentStartTime,
             limit
           },
@@ -56,14 +79,13 @@ class BinanceAPI {
         klines.push(...response.data);
         currentStartTime = response.data[response.data.length - 1][0] + 1;
 
-        // 避免触发限流
+        // 避免限流
         await this._sleep(200);
       } catch (err) {
-        console.error(`Binance API error: ${err.message}`);
+        console.error(`[Binance] API error: ${err.message}`);
         
-        // 重试逻辑
         if (err.response?.status === 429) {
-          console.log('Rate limited, waiting 60s...');
+          console.log('[Binance] Rate limited, waiting 60s...');
           await this._sleep(60000);
           continue;
         }
@@ -111,7 +133,7 @@ class BinanceAPI {
       });
       return response.data.serverTime;
     } catch (err) {
-      console.error('Failed to get server time:', err.message);
+      console.error('[Binance] Failed to get server time:', err.message);
       return Date.now();
     }
   }
@@ -121,22 +143,23 @@ class BinanceAPI {
    */
   async getSymbolInfo(symbol) {
     try {
+      const cleanSymbol = symbol.trim().toUpperCase();
+      
       const response = await axios.get(`${this.baseURL}/exchangeInfo`, {
+        params: { symbol: cleanSymbol },
         timeout: 5000
       });
       
-      const symbolInfo = response.data.symbols.find(s => s.symbol === symbol);
-      if (!symbolInfo) {
-        throw new Error(`Symbol ${symbol} not found`);
+      if (!response.data.symbols || response.data.symbols.length === 0) {
+        throw new Error(`Symbol ${cleanSymbol} not found`);
       }
       
-      return symbolInfo;
+      return response.data.symbols[0];
     } catch (err) {
-      console.error('Failed to get symbol info:', err.message);
+      console.error('[Binance] Failed to get symbol info:', err.message);
       return null;
     }
   }
 }
 
-// ✅ 导出类
 module.exports = BinanceAPI;
