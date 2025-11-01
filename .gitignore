@@ -1,5 +1,8 @@
 node_modules/
 .env
+.env.example
 *.log
 .DS_Store
 test-results/
+# Wallet backups
+scripts/wallet-backup.json
