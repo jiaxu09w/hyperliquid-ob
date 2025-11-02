@@ -310,9 +310,116 @@ module.exports = async ({ req, res, log, error }) => {
 
       if (foundReversal) continue;
 
-      // 追踪止损（保持原逻辑）
-      // 强平检查（保持原逻辑）
-      // ...
+       // ✅ 3.5 追踪止损更新
+            if (unrealizedPnLPercent > config.trailingStopTriggerPercent) {
+              log(`Checking trailing stop (profit: ${unrealizedPnLPercent.toFixed(2)}%)...`);
+      
+              // 获取 ATR
+              const atrData = await databases.listDocuments(
+                config.databaseId,
+                COLLECTIONS.MARKET_DATA,
+                [
+                  Query.equal('symbol', config.symbol),
+                  Query.equal('indicator', 'ATR'),
+                  Query.orderDesc('timestamp'),
+                  Query.limit(1)
+                ]
+              );
+      
+              if (atrData.documents.length > 0) {
+                const atr = atrData.documents[0].value;
+                
+                const newStopLoss = posDoc.side === SIDE.LONG
+                  ? currentPrice - (atr * config.trailingStopMultiplier)
+                  : currentPrice + (atr * config.trailingStopMultiplier);
+      
+                const shouldUpdate = posDoc.side === SIDE.LONG
+                  ? newStopLoss > posDoc.stopLoss
+                  : newStopLoss < posDoc.stopLoss;
+      
+                if (shouldUpdate) {
+                  log(`📈 Updating trailing stop: $${posDoc.stopLoss.toFixed(2)} → $${newStopLoss.toFixed(2)}`);
+      
+                  // 更新交易所的止损单
+                  const updateResult = await hl.updateStopLoss({
+                    symbol: config.symbol,
+                    stopLossOrderId: posDoc.stopLossOrderId,
+                    newStopLoss
+                  });
+      
+                  if (updateResult.success) {
+                    await databases.updateDocument(
+                      config.databaseId,
+                      COLLECTIONS.POSITIONS,
+                      posDoc.$id,
+                      {
+                        stopLoss: newStopLoss,
+                        stopLossOrderId: updateResult.newStopLossOrderId,
+                        lastStopUpdate: new Date().toISOString()
+                      }
+                    );
+      
+                    results.push({
+                      positionId: posDoc.$id,
+                      action: 'trailing_stop_updated',
+                      newStopLoss
+                    });
+      
+                    log('✅ Trailing stop updated');
+                  } else {
+                    log('⚠️  Failed to update trailing stop');
+                  }
+                }
+              }
+            }
+      
+            // ✅ 3.6 检查强平风险
+            if (posDoc.liquidationPrice) {
+              const distanceToLiq = posDoc.side === SIDE.LONG
+                ? ((currentPrice - posDoc.liquidationPrice) / posDoc.liquidationPrice) * 100
+                : ((posDoc.liquidationPrice - currentPrice) / posDoc.liquidationPrice) * 100;
+      
+              if (distanceToLiq < config.liquidationWarningPercent) {
+                log(`⚡ WARNING: Near liquidation! Distance: ${distanceToLiq.toFixed(2)}%`);
+      
+                // 紧急平仓（可选）
+                if (distanceToLiq < 2) {
+                  log('🚨 Emergency close initiated!');
+                  
+                  const closeResult = await hl.closePosition({
+                    symbol: config.symbol,
+                    size: posDoc.size,
+                    price: currentPrice
+                  });
+      
+                  if (closeResult.success) {
+                    await databases.updateDocument(
+                      config.databaseId,
+                      COLLECTIONS.POSITIONS,
+                      posDoc.$id,
+                      {
+                        status: 'CLOSED',
+                        exitTime: new Date().toISOString(),
+                        exitReason: EXIT_REASON.EMERGENCY_CLOSE,
+                        exitPrice: closeResult.executionPrice || currentPrice,
+                        pnl: unrealizedPnL,
+                        exitFee: closeResult.fee || 0
+                      }
+                    );
+      
+                    results.push({
+                      positionId: posDoc.$id,
+                      action: 'emergency_close',
+                      reason: 'near_liquidation',
+                      pnl: unrealizedPnL
+                    });
+      
+                    log('✅ Emergency close executed');
+                    continue;
+                  }
+                }
+              }
+            }
 
       // 更新状态
       await databases.updateDocument(config.databaseId, COLLECTIONS.POSITIONS, posDoc.$id, {
@@ -328,7 +435,7 @@ module.exports = async ({ req, res, log, error }) => {
         unrealizedPnLPercent: unrealizedPnLPercent.toFixed(2)
       });
 
-      log('✅ Updated');
+      log('✅ Status Updated');
     }
 
     const duration = Date.now() - startTime;
@@ -339,7 +446,8 @@ module.exports = async ({ req, res, log, error }) => {
       positionsChecked: openPositions.documents.length,
       currentPrice,
       results,
-      duration
+      duration,
+      timestamp: new Date().toISOString()
     });
 
   } catch (err) {
