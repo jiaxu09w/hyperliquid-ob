@@ -1,13 +1,10 @@
 /**
- * Scanner Function v3.0 - 扫描 Order Block（匹配 TradingView 逻辑）
+ * Scanner v3.2 - 扫描 Order Block（匹配 TradingView）
  * 
- * 改进：
- * ✅ 匹配 TradingView 的 OB 检测逻辑
+ * 新功能：
+ * ✅ 自动忽略周末形成的4H OB
+ * ✅ 完整的 TradingView 逻辑
  * ✅ ATR 大小限制
- * ✅ 3 根蜡烛成交量累加
- * ✅ 保存突破价格
- * ✅ API 错误处理
- * ✅ 参数清理
  */
 
 const { Client, Databases, Query, ID } = require('node-appwrite');
@@ -36,6 +33,24 @@ async function retryWithBackoff(fn, maxRetries = 3, initialDelay = 1000, fnName 
   }
 }
 
+/**
+ * ✅ 检查是否为周末时间
+ */
+function isWeekendTime(timestamp) {
+  const date = new Date(timestamp);
+  const dayOfWeek = date.getUTCDay(); // 0=Sunday, 5=Friday, 6=Saturday
+  const utcHour = date.getUTCHours();
+  
+  // 周五 22:00 UTC 之后
+  const isFridayNight = dayOfWeek === 5 && utcHour >= 22;
+  // 整个周六
+  const isSaturday = dayOfWeek === 6;
+  // 整个周日
+  const isSunday = dayOfWeek === 0;
+  
+  return isFridayNight || isSaturday || isSunday;
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // 主函数
 // ═════════════════════════════════════════════════════════════════════════
@@ -45,52 +60,40 @@ module.exports = async ({ req, res, log, error }) => {
 
   try {
     log('━'.repeat(60));
-    log('🔍 Scanner v3.0 - TradingView Compatible');
+    log('🔍 Scanner v3.2 - TradingView Compatible + Weekend Filter');
     log('━'.repeat(60));
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 配置
-    // ═══════════════════════════════════════════════════════════════════════
-    
     const config = {
-      // Appwrite
       endpoint: process.env.APPWRITE_ENDPOINT,
       projectId: process.env.APPWRITE_PROJECT_ID,
       apiKey: process.env.APPWRITE_API_KEY,
       databaseId: process.env.APPWRITE_DATABASE_ID,
       
-      // Trading pairs
       symbol: (process.env.TRADING_SYMBOL || 'BTCUSDT').trim().toUpperCase(),
       timeframe: (process.env.ENTRY_TIMEFRAME || '4h').trim().toLowerCase(),
       
-      // OB Detection
       swingLength: parseInt(process.env.OB_SWING_LENGTH) || 10,
       volumeLookback: parseInt(process.env.VOLUME_LOOKBACK) || 20,
       volumeMethod: (process.env.VOLUME_METHOD || 'percentile').trim().toLowerCase(),
       volumeParam: parseInt(process.env.VOLUME_PARAM) || 70,
       
-      // ATR
-      atrPeriod: parseInt(process.env.ATR_PERIOD) || 14,
+      atrPeriod: parseInt(process.env.ATR_PERIOD) || 10,  // ✅ 改为10（匹配TradingView）
       maxATRMultiplier: parseFloat(process.env.MAX_ATR_MULTIPLIER) || 3.5,
       
-      // Data
       lookbackCandles: parseInt(process.env.LOOKBACK_CANDLES) || 100,
+      maxRetries: parseInt(process.env.MAX_RETRIES) || 3,
       
-      // API
-      maxRetries: parseInt(process.env.MAX_RETRIES) || 3
+      // ✅ 周末过滤（仅4H）
+      ignoreWeekendOBs: process.env.IGNORE_WEEKEND_OBS !== 'false'  // 默认启用
     };
 
     log(`\n⚙️  Configuration:`);
     log(`   Symbol: ${config.symbol}`);
     log(`   Timeframe: ${config.timeframe}`);
     log(`   Swing Length: ${config.swingLength}`);
-    log(`   Volume Method: ${config.volumeMethod} (${config.volumeParam})`);
-    log(`   Max ATR Multiplier: ${config.maxATRMultiplier}x`);
+    log(`   ATR Period: ${config.atrPeriod} (TradingView compatible)`);
+    log(`   Ignore Weekend OBs (4H): ${config.ignoreWeekendOBs && config.timeframe === '4h' ? 'Yes' : 'No'}`);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 初始化
-    // ═══════════════════════════════════════════════════════════════════════
-    
     const client = new Client()
       .setEndpoint(config.endpoint)
       .setProject(config.projectId)
@@ -99,10 +102,7 @@ module.exports = async ({ req, res, log, error }) => {
     const databases = new Databases(client);
     const binance = new BinanceAPI();
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 1. 获取 K 线数据
-    // ═══════════════════════════════════════════════════════════════════════
-    
+    // 1️⃣ 获取 K 线数据
     log(`\n1️⃣  Fetching klines...`);
     
     const klines = await retryWithBackoff(
@@ -120,10 +120,7 @@ module.exports = async ({ req, res, log, error }) => {
     log(`   Latest: ${new Date(klines[klines.length - 1].timestamp).toISOString()}`);
     log(`   Price: $${klines[klines.length - 1].close.toFixed(2)}`);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 2. 计算 ATR
-    // ═══════════════════════════════════════════════════════════════════════
-    
+    // 2️⃣ 计算 ATR
     log(`\n2️⃣  Calculating ATR...`);
 
     const atrValues = ATR.calculate({
@@ -142,10 +139,7 @@ module.exports = async ({ req, res, log, error }) => {
       log(`   ⚠️  ATR not available (insufficient data)`);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 3. 检测 OB
-    // ═══════════════════════════════════════════════════════════════════════
-    
+    // 3️⃣ 检测 OB
     log(`\n3️⃣  Detecting Order Blocks...`);
 
     const { bullishOBs, bearishOBs } = findPotentialOrderBlocks(
@@ -163,10 +157,7 @@ module.exports = async ({ req, res, log, error }) => {
     log(`   ├─ Bullish: ${bullishOBs.length}`);
     log(`   └─ Bearish: ${bearishOBs.length}`);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 4. 过滤新形成的 OB（最近 2 根蜡烛）
-    // ═══════════════════════════════════════════════════════════════════════
-    
+    // 4️⃣ 过滤新 OB
     log(`\n4️⃣  Filtering new OBs...`);
 
     const latestIndex = klines.length - 1;
@@ -176,18 +167,63 @@ module.exports = async ({ req, res, log, error }) => {
 
     log(`   ${newOBs.length} new OBs to process`);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 5. 保存新 OB 到数据库
-    // ═══════════════════════════════════════════════════════════════════════
-    
+    // 5️⃣ 保存 OB
     log(`\n5️⃣  Saving to database...`);
 
     let savedCount = 0;
     let skippedCount = 0;
+    let weekendSkippedCount = 0;
 
     for (const ob of newOBs) {
       try {
-        // 检查是否已存在（避免重复）
+        // ✅ 周末检测（仅4H）
+        const is4H = config.timeframe === '4h';
+        const isWeekend = isWeekendTime(ob.confirmationCandle.timestamp);
+        
+        if (is4H && isWeekend && config.ignoreWeekendOBs) {
+          log(`   ⏭️  WEEKEND OB - Auto-ignoring`);
+          log(`      Type: ${ob.type} | Time: ${new Date(ob.confirmationCandle.timestamp).toISOString()}`);
+          log(`      Range: $${ob.low.toFixed(2)} - $${ob.high.toFixed(2)}`);
+          
+          await databases.createDocument(
+            config.databaseId,
+            COLLECTIONS.ORDER_BLOCKS,
+            ID.unique(),
+            {
+              symbol: config.symbol,
+              timeframe: config.timeframe,
+              type: ob.type,
+              top: ob.high,
+              bottom: ob.low,
+              confirmationTime: ob.confirmationCandle.timestamp.toISOString(),
+              obCandleTime: ob.obCandle.timestamp.toISOString(),
+              createdAt: new Date().toISOString(),
+              
+              breakoutPrice: ob.confirmationCandle.close,
+              confirmationCandleClose: ob.confirmationCandle.close,
+              confidence: ob.confidence,
+              volume: ob.volume,
+              
+              isActive: false,
+              isBroken: false,
+              isProcessed: true,
+              processedAt: new Date().toISOString(),
+              processedReason: 'weekend_formation',
+              
+              metadata: JSON.stringify({
+                weekendOB: true,
+                formationDay: new Date(ob.confirmationCandle.timestamp).getUTCDay(),
+                formationTime: ob.confirmationCandle.timestamp.toISOString(),
+                reason: 'Formed during weekend no-trade period'
+              })
+            }
+          );
+          
+          weekendSkippedCount++;
+          continue;
+        }
+        
+        // 检查重复
         const existing = await databases.listDocuments(
           config.databaseId,
           COLLECTIONS.ORDER_BLOCKS,
@@ -200,51 +236,42 @@ module.exports = async ({ req, res, log, error }) => {
         );
 
         if (existing.documents.length === 0) {
-          // 保存新 OB
-          const obDoc = await databases.createDocument(
+          await databases.createDocument(
             config.databaseId,
             COLLECTIONS.ORDER_BLOCKS,
             ID.unique(),
             {
-              // 基本信息
               symbol: config.symbol,
               timeframe: config.timeframe,
               type: ob.type,
               top: ob.high,
               bottom: ob.low,
               
-              // 时间戳
               confirmationTime: ob.confirmationCandle.timestamp.toISOString(),
               obCandleTime: ob.obCandle.timestamp.toISOString(),
               createdAt: new Date().toISOString(),
               
-              // ✅ 突破价格（用于入场）
               breakoutPrice: ob.confirmationCandle.close,
               confirmationCandleClose: ob.confirmationCandle.close,
               confirmationCandleHigh: ob.confirmationCandle.high,
               confirmationCandleLow: ob.confirmationCandle.low,
               confirmationCandleVolume: ob.confirmationCandle.volume,
               
-              // ✅ OB 蜡烛信息
               obCandleHigh: ob.obCandle.high,
               obCandleLow: ob.obCandle.low,
               obCandleOpen: ob.obCandle.open,
               obCandleClose: ob.obCandle.close,
               
-              // ✅ 成交量信息（3根蜡烛）
               volume: ob.volume,
               obLowVolume: ob.obLowVolume,
               obHighVolume: ob.obHighVolume,
               
-              // 置信度
               confidence: ob.confidence,
               
-              // 状态
               isActive: true,
               isBroken: false,
               isProcessed: false,
               
-              // 元数据
               metadata: JSON.stringify({
                 swingLength: config.swingLength,
                 volumeMethod: config.volumeMethod,
@@ -259,22 +286,17 @@ module.exports = async ({ req, res, log, error }) => {
           savedCount++;
           log(`   ✅ Saved ${ob.type} OB @ $${ob.low.toFixed(2)}-$${ob.high.toFixed(2)}`);
           log(`      Breakout: $${ob.confirmationCandle.close.toFixed(2)}`);
-          log(`      Volume: ${ob.volume.toFixed(0)} (H:${ob.obHighVolume.toFixed(0)} / L:${ob.obLowVolume.toFixed(0)})`);
           log(`      Confidence: ${ob.confidence}`);
         } else {
           skippedCount++;
-          log(`   ⏭️  Skipped duplicate OB @ ${ob.confirmationCandle.timestamp.toISOString()}`);
         }
       } catch (saveErr) {
         error(`   ❌ Failed to save OB: ${saveErr.message}`);
       }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 6. 更新已有 OB 的状态（检查是否被突破）
-    // ═══════════════════════════════════════════════════════════════════════
-    
-    log(`\n6️⃣  Checking existing OBs for breaks...`);
+    // 6️⃣ 检查已有 OB
+    log(`\n6️⃣  Checking existing OBs...`);
     
     const currentPrice = klines[latestIndex].close;
     const currentLow = klines[latestIndex].low;
@@ -298,7 +320,6 @@ module.exports = async ({ req, res, log, error }) => {
     let brokenCount = 0;
     
     for (const obDoc of activeOBs.documents || []) {
-      // ✅ 使用收盘价或最低/最高价检查（根据配置）
       const useWick = process.env.OB_INVALIDATION_METHOD !== 'close';
       
       const isBroken = obDoc.type === 'BULLISH'
@@ -326,16 +347,13 @@ module.exports = async ({ req, res, log, error }) => {
       log(`   ✅ No OBs broken`);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 完成
-    // ═══════════════════════════════════════════════════════════════════════
-    
     const duration = Date.now() - startTime;
     
     log(`\n${'━'.repeat(60)}`);
     log(`✅ Scanner completed in ${duration}ms`);
-    log(`   New OBs: ${savedCount}`);
-    log(`   Broken OBs: ${brokenCount}`);
+    log(`   New OBs saved: ${savedCount}`);
+    log(`   Weekend OBs ignored: ${weekendSkippedCount}`);
+    log(`   OBs broken: ${brokenCount}`);
     log(`   Duplicates: ${skippedCount}`);
     log(`${'━'.repeat(60)}\n`);
 
@@ -343,6 +361,7 @@ module.exports = async ({ req, res, log, error }) => {
       success: true,
       summary: {
         newOBs: savedCount,
+        weekendOBsIgnored: weekendSkippedCount,
         brokenOBs: brokenCount,
         duplicates: skippedCount,
         totalOBsChecked: activeOBs.documents.length,
@@ -350,12 +369,6 @@ module.exports = async ({ req, res, log, error }) => {
         symbol: config.symbol,
         timeframe: config.timeframe,
         atr: currentATR
-      },
-      details: {
-        bullishOBs: bullishOBs.length,
-        bearishOBs: bearishOBs.length,
-        totalDetected: allOBs.length,
-        newOBsDetected: newOBs.length
       },
       duration,
       timestamp: new Date().toISOString()
